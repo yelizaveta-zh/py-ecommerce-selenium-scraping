@@ -1,34 +1,23 @@
-import logging
-import sys
 from dataclasses import dataclass, astuple, fields
 from urllib.parse import urljoin
 import csv
 import time
 
-import requests
-from bs4 import BeautifulSoup, Tag
 from selenium import webdriver
-from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.common import NoSuchElementException
 
 
 BASE_URL = "https://webscraper.io/"
 HOME_URL = urljoin(BASE_URL, "test-sites/e-commerce/more/")
-LAPTOP_URL = urljoin(
-    BASE_URL, "test-sites/e-commerce/static/computers/laptops"
-)
-
-_driver: WebDriver = None
-
-
-def get_driver() -> WebDriver:
-    return _driver
-
-
-def set_driver(new_driver: WebDriver) -> None:
-    global _driver
-    _driver = new_driver
+PAGES = {
+    "home": HOME_URL,
+    "computers": f"{HOME_URL}computers",
+    "laptops": f"{HOME_URL}computers/laptops",
+    "tablets": f"{HOME_URL}computers/tablets",
+    "phones": f"{HOME_URL}phones",
+    "touch": f"{HOME_URL}phones/touch",
+}
 
 
 @dataclass
@@ -38,103 +27,73 @@ class Product:
     price: float
     rating: int
     num_of_reviews: int
-    additional_info: dict
+
+
+op = webdriver.ChromeOptions()
+op.add_argument("headless")
+driver = webdriver.Chrome(options=op)
 
 
 PRODUCT_FIELDS = [field.name for field in fields(Product)]
 
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="[%(levelname)8s]: %(message)s",
-    handlers=[
-        logging.FileHandler("parser.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-
-
-def parse_hdd_block_prices(product_soup: Tag) -> dict[str, float]:
-    absolute_url = urljoin(BASE_URL, product_soup.select_one(".title")["href"])
-    driver = get_driver()
-    driver.get(absolute_url)
-    swatches = driver.find_element(By.CLASS_NAME, "swatches")
-    buttons = swatches.find_elements(By.TAG_NAME, "button")
-
-    prices = {}
-    for button in buttons:
-        if not button.get_property("disabled"):
-            button.click()
-            prices[button.get_property("value")] = float(
-                driver.find_element(
-                    By.CLASS_NAME, "price"
-                ).text.replace("$", "")
-            )
-    return prices
-
-
-def parse_single_product(product: Tag) -> Product:
-    hdd_prices = parse_hdd_block_prices(product)
+def extract_product(product: webdriver) -> Product:
     return Product(
-        title=product.select_one(".title")["title"],
-        description=product.select_one(".description").text,
-        price=float(product.select_one(".price").text.replace("$", "")),
-        rating=int(product.select_one("p[data-rating]")["data-rating"]),
-        num_of_reviews=int(
-            product.select_one(".review-count").text.split()[0]
+        title=product.find_element(
+            By.CSS_SELECTOR, "a.title"
+        ).get_attribute("title"),
+        description=product.find_element(
+            By.CSS_SELECTOR, "p.description"
+        ).text,
+        price=float(
+            product.find_element(By.CSS_SELECTOR, "h4.price").text[1:]),
+        rating=len(
+            product.find_elements(By.CSS_SELECTOR, "span.ws-icon-star")
         ),
-        additional_info={"hdd_prices": hdd_prices},
+        num_of_reviews=int(
+            product.find_element(By.CSS_SELECTOR, "p.review-count")
+            .text.split()[0]
+        ),
     )
 
 
-def get_home_products() -> [Product]:
-    text = requests.get(HOME_URL).content
-    soup = BeautifulSoup(text, "html.parser")
-    products = soup.select(".card-body")
-    return [parse_single_product(product) for product in products]
+def parse_page(url: str) -> list[Product]:
+    driver.get(url)
+    try:
+        while True:
+            button = (
+                driver.find_element(
+                    By.CSS_SELECTOR, ".ecomerce-items-scroll-more"
+                )
+            )
+            if "display: none" in button.get_attribute("style"):
+                raise NoSuchElementException
+            driver.execute_script("arguments[0].click();", button)
+            time.sleep(0.1)
+    except NoSuchElementException:
+        products = []
+        for product in driver.find_elements(By.CSS_SELECTOR, "div.card-body"):
+            products.append(extract_product(product))
+        return products
 
 
-def get_num_pages(page_soup: Tag) -> int:
-    pagination = page_soup.select_one(".pagination")
-    if pagination is None:
-        return 1
-    return int(pagination.select("li")[-2].text)
-
-
-def get_single_page_products(page_soup: Tag) -> [Product]:
-    products = page_soup.select(".card-body")
-    return [parse_single_product(product) for product in products]
-
-
-def get_laptop_page_products(driver: webdriver.Chrome) -> [Product]:
-    logging.info("Starting parsing laptops")
-    text = requests.get(LAPTOP_URL).content
-    first_page_soup = BeautifulSoup(text, "html.parser")
-
-    all_products = get_single_page_products(first_page_soup)
-    # num of pages
-    num_pages = get_num_pages(first_page_soup)
-    # iterate
-    for page_num in range(2, num_pages + 1):
-        logging.info(f"Start parsing page #{page_num}")
-        text = requests.get(LAPTOP_URL, {"page": page_num}).content
-        next_page_soup = BeautifulSoup(text, "html.parser")
-        all_products.extend(get_single_page_products(next_page_soup))
-    return all_products
-
-
-def write_product_to_csv(products: [Product]) -> None:
-    with open("result.csv", "w") as file:
+def write_product_to_csv(
+        products: [Product],
+        file_name: str
+) -> None:
+    with open(f"{file_name}.csv", "w", encoding="utf-8", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(PRODUCT_FIELDS)
-        writer.writerows([astuple(product) for product in products])
+        writer.writerows(astuple(product) for product in products)
 
 
-def main() -> None:
-    with webdriver.Chrome() as driver:
-        set_driver(driver)
-        write_product_to_csv(get_laptop_page_products())
+def get_all_products() -> None:
+    pass
+    for file_name, url in PAGES.items():
+        products = parse_page(url)
+        write_product_to_csv(products, file_name)
+    driver.close()
 
 
 if __name__ == "__main__":
-    main()
+    get_all_products()
